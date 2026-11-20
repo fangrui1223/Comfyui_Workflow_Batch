@@ -1,0 +1,73 @@
+{
+  "2": {
+    "inputs": {
+      "num_frames": 1,
+      "input_video_frames": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "ExtractStartFramesForContinuations",
+    "_meta": {
+      "title": "提取起始帧用于延续"
+    }
+  },
+  "3": {
+    "inputs": {
+      "video": "98f4bbf3-91cd-4b7f-91da-a174c033e802.mp4",
+      "force_rate": 0,
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": 0,
+      "skip_first_frames": 0,
+      "select_every_nth": 1,
+      "format": "AnimateDiff"
+    },
+    "class_type": "VHS_LoadVideo",
+    "_meta": {
+      "title": "加载视频"
+    }
+  },
+  "4": {
+    "inputs": {
+      "images": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "预览图像"
+    }
+  },
+  "13": {
+    "inputs": {
+      "text": "./batch-first-frame"
+    },
+    "class_type": "CR Text",
+    "_meta": {
+      "title": "🔤 CR Text"
+    }
+  },
+  "14": {
+    "inputs": {
+      "save_dir": [
+        "13",
+        0
+      ],
+      "folder_name": "RY",
+      "save_name": "V1Z",
+      "save_format": "jpg",
+      "quality": 100,
+      "copy_to_comfy_output": true,
+      "images": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "RuiUniversalImageSaver",
+    "_meta": {
+      "title": "Rui 通用图像保存器"
+    }
+  }
+}
