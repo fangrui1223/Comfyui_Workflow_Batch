@@ -1,177 +1,183 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>FR_工作流通用批量工具</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260603l" />
-  </head>
-  <body>
-    <main class="shell">
-      <section class="hero">
-        <div class="hero-copy">
-          <p class="eyebrow">ComfyUI Batch Console</p>
-          <h1>FR_工作流通用批量工具</h1>
-          <p>导入 API 工作流，识别上传与保存节点，配置素材矩阵后自动排队生成。</p>
-        </div>
-      </section>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090a17">
+  <title>FR 工作流通用批量工具</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/styles.css?v=20261120-console">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#" aria-label="FR 批量工具首页"><span class="brand-mark" aria-hidden="true">FR</span><span>ComfyUI Batch</span></a>
+      <nav aria-label="控制台导航">
+        <a href="#new-job">新建任务</a>
+        <a href="#queue">运行队列</a>
+        <a href="#environment" id="settingsLink">环境设置</a>
+      </nav>
+      <div class="connection" id="connectionBadge" data-state="unchecked">
+        <span class="connection-light" aria-hidden="true"></span>
+        <span id="comfyStatus" role="status">未检测连接</span>
+      </div>
+    </div>
+  </header>
 
-      <section class="grid">
-        <div class="panel settings-panel">
-          <div class="panel-head">
-            <h2>环境设置</h2>
-            <button class="icon-button" id="checkComfyBtn" title="检测 ComfyUI 连接">⌁</button>
+  <main class="shell">
+    <header class="hero">
+      <h1>FR <span>工作流通用批量工具</span></h1>
+      <p>导入 ComfyUI API 工作流，预览素材配对，按队列依次执行。</p>
+    </header>
+
+    <div class="console-grid">
+      <section id="new-job" class="panel draft-panel" aria-labelledby="newJobTitle">
+        <div class="panel-head">
+          <div class="section-title"><span class="section-icon icon-upload" aria-hidden="true"></span><h2 id="newJobTitle">新建任务</h2></div>
+          <span id="workflowBadge" class="workflow-badge" title="等待上传">等待上传</span>
+        </div>
+
+        <input id="workflowFile" type="file" accept=".json,application/json" hidden>
+        <button id="dropZone" class="upload-zone" type="button" data-state="idle" aria-describedby="uploadHint">
+          <span class="starfield" aria-hidden="true"></span>
+          <span class="orbital" aria-hidden="true">
+            <span class="orbital-guide"></span>
+            <span class="orbit orbit-one"><i></i></span>
+            <span class="orbit orbit-two"><i></i></span>
+            <span class="orbit orbit-three"><i></i></span>
+            <span class="orb-core"></span>
+          </span>
+          <span class="upload-copy">
+            <span id="uploadTitle">上传 API 工作流</span>
+            <small id="uploadHint">点击选择或拖入 JSON 文件</small>
+          </span>
+        </button>
+        <div class="draft-fields">
+          <div class="field-stack">
+            <label for="workflowPath">从本地路径读取</label>
+            <div class="field-row workflow-path-row">
+              <input id="workflowPath" spellcheck="false" placeholder="粘贴 API JSON 的完整路径">
+              <button data-pick="workflow" data-target="workflowPath">选择并读取</button>
+              <button id="analyzePathBtn">读取</button>
+            </div>
           </div>
-          <label>ComfyUI 根目录
+          <div class="field-stack">
+            <label for="outputDir">本任务成品保存目录</label>
             <div class="field-row">
-              <input id="comfyRoot" spellcheck="false" />
-              <button data-pick="folder" data-target="comfyRoot">选择</button>
-            </div>
-          </label>
-          <label>ComfyUI Python
-            <div class="field-row">
-              <input id="pythonPath" spellcheck="false" />
-              <button data-pick="file" data-target="pythonPath">选择</button>
-            </div>
-          </label>
-          <label>服务地址
-            <input id="serverUrl" spellcheck="false" />
-          </label>
-          <label>输出保存目录
-            <div class="field-row">
-              <input id="outputDir" spellcheck="false" />
+              <input id="outputDir" spellcheck="false" placeholder="选择生成结果的保存目录">
               <button data-pick="folder" data-target="outputDir">选择</button>
             </div>
-          </label>
-          <div class="actions">
-            <button id="saveConfigBtn">保存设置</button>
           </div>
-          <p class="status-line" id="comfyStatus">等待检测</p>
         </div>
-
-        <div class="panel workflow-panel">
-          <div class="panel-head">
-            <div class="workflow-title">
-              <h2>工作流</h2>
-              <span>拖入 API JSON 或点击选择</span>
-            </div>
-            <span id="workflowBadge" class="badge">未导入</span>
-          </div>
-          <div class="drop-zone" id="dropZone">
-            <input id="workflowFile" type="file" accept=".json" hidden />
-            <div class="star-field" aria-hidden="true">
-              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-              <i></i><i></i><i></i><i></i>
-            </div>
-            <div class="drop-stage" aria-hidden="true">
-              <div class="orb">
-                <div class="aura"></div>
-                <div class="core"></div>
-                <div class="ring ring-a"></div>
-                <div class="ring ring-b"></div>
-                <div class="ring ring-c"></div>
-              </div>
-            </div>
-          </div>
-          <label>工作流路径
-            <div class="field-row workflow-path-row">
-              <input id="workflowPath" spellcheck="false" />
-              <button data-pick="workflow" data-target="workflowPath">选择</button>
-              <button id="analyzePathBtn">识别工作流</button>
-            </div>
-          </label>
-        </div>
+        <p id="analysisWarning" class="notice" role="status"></p>
       </section>
 
-      <section class="panel nodes-panel">
+      <section id="queue" class="panel run-panel" aria-labelledby="queueTitle">
         <div class="panel-head">
-          <h2>识别节点</h2>
-          <span class="hint">节点编号会一直显示，方便区分同类型上传点。</span>
-        </div>
-        <div class="split">
-          <div>
-            <h3>输入节点</h3>
-            <div id="inputNodes" class="node-list empty">导入工作流后显示</div>
-          </div>
-          <div>
-            <h3>输出节点</h3>
-            <div id="outputNodes" class="node-list empty">导入工作流后显示</div>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel run-panel">
-        <div class="panel-head">
-          <h2>运行</h2>
+          <div class="section-title"><span class="section-icon icon-queue" aria-hidden="true"></span><h2 id="queueTitle">运行队列</h2></div>
           <div class="run-buttons">
-            <button id="runBtn" class="primary">开始批量</button>
-            <button id="stopBtn">停止后续</button>
+            <button id="pauseBtn" class="button-pause" disabled>暂停</button>
+            <button id="startBtn" class="primary button-start" disabled>开始队列</button>
           </div>
         </div>
-        <div class="meter">
-          <div id="progressBar"></div>
+        <div id="queueMonitor" class="queue-monitor" data-state="idle">
+          <p class="status-line" id="queueStatus" role="status">正在载入队列</p>
+          <div class="meter" aria-hidden="true"><div id="progressBar"></div></div>
+          <dl class="stats" aria-label="队列统计">
+            <div class="stat stat-total"><dt>已处理</dt><dd id="statTotal">0 / 0</dd></div>
+            <div class="stat stat-success"><dt>成功</dt><dd id="statSuccess">0</dd></div>
+            <div class="stat stat-failed"><dt>失败</dt><dd id="statFailed">0</dd></div>
+            <div class="stat stat-skipped"><dt>跳过</dt><dd id="statSkipped">0</dd></div>
+          </dl>
         </div>
-        <div class="stats">
-          <span id="statCurrent">0 / 0</span>
-          <span id="statSuccess">成功 0</span>
-          <span id="statFailed">失败 0</span>
-          <span id="statMessage">等待任务</span>
-        </div>
-        <div id="logs" class="logs"></div>
+        <div id="jobs" class="table-scroll"></div>
+        <section id="jobDetails" hidden aria-labelledby="jobDetailsTitle">
+          <div class="panel-head">
+            <h3 id="jobDetailsTitle">执行明细</h3>
+            <button id="closeDetails">关闭明细</button>
+          </div>
+          <div id="items" class="table-scroll"></div>
+        </section>
+        <details class="log-details">
+          <summary><span class="log-icon" aria-hidden="true"></span>运行日志<span class="disclosure" aria-hidden="true"></span></summary>
+          <div id="logs" class="logs"></div>
+        </details>
       </section>
-    </main>
+    </div>
 
-    <template id="inputNodeTemplate">
-      <article class="node-card">
-        <div class="node-top">
-          <label class="switch"><input type="checkbox" data-field="enabled" checked /><span></span></label>
+    <section id="bindings" class="panel binding-panel" aria-labelledby="bindingsTitle" hidden>
+      <div class="panel-head bindings-heading"><h2 id="bindingsTitle">工作流配置</h2></div>
+        <div class="split binding-grid">
           <div>
-            <strong data-field-text="headline"></strong>
-            <small data-field-text="meta"></small>
+            <div class="panel-head">
+              <h3>素材入口</h3>
+              <button id="addInput">添加入口</button>
+            </div>
+            <div id="inputNodes" class="node-list"></div>
           </div>
-          <em data-field-text="confidence"></em>
-        </div>
-        <div class="node-controls">
-          <label>用途
-            <select data-field="role">
-              <option value="image">图片</option>
-              <option value="video">视频</option>
-              <option value="file">普通文件</option>
-            </select>
-          </label>
-          <label>方式
-            <select data-field="source_mode">
-              <option value="folder">文件夹批量</option>
-              <option value="single">单文件固定</option>
-            </select>
-          </label>
-        </div>
-        <label>素材路径
-          <div class="field-row">
-            <input data-field="source_path" spellcheck="false" />
-            <button data-node-pick>选择</button>
+          <div>
+            <div class="panel-head">
+              <h3>成品输出</h3>
+              <button id="addOutput">添加输出</button>
+            </div>
+            <div id="outputNodes" class="node-list"></div>
           </div>
+        </div>
+        <div class="actions preview-actions">
+          <button id="previewBtn">预览配对</button>
+          <button id="enqueueBtn" class="primary" disabled>加入队列</button>
+        </div>
+        <p id="draftStatus" class="status-line" role="status"></p>
+        <section id="preview" hidden aria-labelledby="previewTitle">
+          <h3 id="previewTitle">配对预览</h3>
+          <div id="unmatched" class="warning"></div>
+          <div id="previewRows" class="table-scroll"></div>
+        </section>
+    </section>
+
+    <details id="environment" class="panel settings-details" aria-label="环境设置">
+      <summary><span class="section-icon icon-settings" aria-hidden="true"></span><span>环境设置</span><span class="disclosure" aria-hidden="true"></span></summary>
+      <div class="grid settings-grid">
+        <label>ComfyUI 根目录
+          <span class="field-row">
+            <input id="comfyRoot" spellcheck="false">
+            <button data-pick="folder" data-target="comfyRoot">选择</button>
+          </span>
         </label>
-      </article>
-    </template>
+        <label>服务地址
+          <input id="serverUrl" type="url" spellcheck="false">
+        </label>
+        <label>ComfyUI input 目录
+          <span class="field-row">
+            <input id="comfyInputDir" placeholder="留空使用根目录下的 input" spellcheck="false">
+            <button data-pick="folder" data-target="comfyInputDir">选择</button>
+          </span>
+        </label>
+        <label>ComfyUI output 目录
+          <span class="field-row">
+            <input id="comfyOutputDir" placeholder="留空使用根目录下的 output" spellcheck="false">
+            <button data-pick="folder" data-target="comfyOutputDir">选择</button>
+          </span>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="checkComfyBtn">检测连接</button>
+        <button id="saveConfigBtn">保存设置</button>
+      </div>
+    </details>
 
-    <template id="outputNodeTemplate">
-      <article class="node-card compact">
-        <div class="node-top">
-          <label class="switch"><input type="checkbox" data-field="enabled" /><span></span></label>
-          <div>
-            <strong data-field-text="headline"></strong>
-            <small data-field-text="meta"></small>
-          </div>
-          <em data-field-text="confidence"></em>
+    <dialog id="bindingDialog">
+      <form method="dialog" id="bindingForm">
+        <h2 id="bindingTitle">手动绑定</h2>
+        <label>节点<select id="bindingNode" required></select></label>
+        <label id="bindingFieldRow">字段<select id="bindingField"></select></label>
+        <div class="actions">
+          <button value="cancel" formnovalidate>取消</button>
+          <button value="confirm" class="primary">添加</button>
         </div>
-      </article>
-    </template>
-
-    <script src="/static/app.js?v=20260603l"></script>
-  </body>
+      </form>
+    </dialog>
+  </main>
+  <script src="/static/app.js?v=20261120-console"></script>
+</body>
 </html>

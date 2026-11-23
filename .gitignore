@@ -1,3 +1,4 @@
 /config.json
+/batch_queue.sqlite3*
 __pycache__/
 *.py[cod]

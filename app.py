@@ -1,674 +1,348 @@
-import copy
 import json
+import logging
 import os
-import re
-import shutil
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 import webbrowser
-import logging
+from collections import OrderedDict
 from pathlib import Path
+from urllib.parse import urlsplit
 
-try:
-    from flask import Flask, jsonify, request, send_from_directory
-except ImportError as exc:
-    print("缺少 Flask。请使用 ComfyUI 自带 Python 安装一次: python -m pip install flask")
-    raise
+from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.serving import WSGIRequestHandler, make_server
 
+from batch_queue import BatchWorker, QueueConflict, QueueStore
+from comfy_execution import comfy_request, paths_for
+from workflow_batch import WorkflowGraph, checked_workflow, local_path, normalize_bindings, path_value, plan_batches
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-CONFIG_FILE = BASE_DIR / "config.json"
-
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
-OUTPUT_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | {".gif", ".wav", ".mp3", ".flac"}
-
 DEFAULT_CONFIG = {
     "comfy_root": r"C:\FR_comfyui",
     "python_path": r"C:\FR_comfyui\python\python.exe",
     "server_url": "http://127.0.0.1:8188",
+    "comfy_input_dir": "",
+    "comfy_output_dir": "",
     "last_workflow_path": "",
     "last_output_dir": "",
     "last_input_dir": "",
-    "poll_interval": 20,
+    "poll_interval": 1,
 }
-
-app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
-app.logger.disabled = True
-logging.getLogger("werkzeug").disabled = True
 
 
 class QuietRequestHandler(WSGIRequestHandler):
-    def log(self, type, message, *args):
-        return
-
-STATE_LOCK = threading.Lock()
-WORKFLOW_CACHE = {}
-RUN_STATE = {
-    "running": False,
-    "stop_requested": False,
-    "started_at": None,
-    "finished_at": None,
-    "total": 0,
-    "current": 0,
-    "success": 0,
-    "failed": 0,
-    "message": "等待任务",
-    "logs": [],
-}
+    def log(self, kind, message, *args):
+        if kind == "error":
+            super().log(kind, message, *args)
 
 
-def natural_sort_key(value):
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", value)]
+class Recent:
+    def __init__(self, capacity=24):
+        self.capacity = capacity
+        self.values = OrderedDict()
+        self.lock = threading.Lock()
+
+    def put(self, key, value):
+        with self.lock:
+            self.values[key] = value
+            self.values.move_to_end(key)
+            if len(self.values) > self.capacity:
+                self.values.popitem(last=False)
+
+    def get(self, key):
+        with self.lock:
+            return self.values.get(key)
 
 
-def safe_json_load(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def load_config():
-    if not CONFIG_FILE.exists():
+def load_config(path):
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+        return {**DEFAULT_CONFIG, **{key: config[key] for key in DEFAULT_CONFIG if key in config}}
+    except (OSError, ValueError, TypeError):
         return dict(DEFAULT_CONFIG)
+
+
+def merge_config(old, updates):
+    if not isinstance(updates, dict):
+        raise ValueError("环境设置格式无效")
+    return {key: updates.get(key, old[key]) for key in DEFAULT_CONFIG}
+
+
+def write_config(path, config):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        data = safe_json_load(CONFIG_FILE)
-    except Exception:
-        return dict(DEFAULT_CONFIG)
-    config = dict(DEFAULT_CONFIG)
-    config.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
-    return config
+        temp.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
-def save_config(config):
-    clean = dict(DEFAULT_CONFIG)
-    clean.update({k: config.get(k, v) for k, v in DEFAULT_CONFIG.items()})
-    CONFIG_FILE.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
-    return clean
+def server_address(config):
+    address = str(config["server_url"] or "").strip().rstrip("/")
+    split = urlsplit(address)
+    if split.scheme not in {"http", "https"} or not split.hostname or split.query or split.fragment:
+        raise ValueError("ComfyUI 服务地址需要是 http 或 https 地址")
+    return address
 
 
-def add_log(message, level="info"):
-    timestamp = time.strftime("%H:%M:%S")
-    with STATE_LOCK:
-        RUN_STATE["logs"].append(
-            {
-                "time": timestamp,
-                "level": level,
-                "message": message,
-            }
-        )
-        RUN_STATE["logs"] = RUN_STATE["logs"][-300:]
-        RUN_STATE["message"] = message
-    print(f"[{timestamp}] {level:<7} {message}", flush=True)
+def body():
+    value = request.get_json(silent=True)
+    if not isinstance(value, dict):
+        raise ValueError("请求格式无效")
+    return value
 
 
-def reset_run_state(total=0):
-    with STATE_LOCK:
-        RUN_STATE.update(
-            {
-                "running": True,
-                "stop_requested": False,
-                "started_at": time.time(),
-                "finished_at": None,
-                "total": total,
-                "current": 0,
-                "success": 0,
-                "failed": 0,
-                "message": "任务启动中",
-                "logs": [],
-            }
-        )
+def create_app(config_path=None, db_path=None, transport=comfy_request):
+    app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
+    config_path = Path(config_path or os.environ.get("COMFY_BATCH_CONFIG", BASE_DIR / "config.json"))
+    db_path = Path(db_path or os.environ.get("COMFY_BATCH_DB", BASE_DIR / "batch_queue.sqlite3"))
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = QueueStore(db_path)
+    worker = BatchWorker(store, request=transport)
+    workflows = Recent()
+    previews = Recent()
+    metadata_cache = Recent(5)
+    config_lock = threading.Lock()
+    app.extensions["batch_worker"] = worker
+    app.extensions["batch_store"] = store
 
-
-def finish_run_state(message):
-    timestamp = time.strftime("%H:%M:%S")
-    with STATE_LOCK:
-        RUN_STATE["running"] = False
-        RUN_STATE["finished_at"] = time.time()
-        RUN_STATE["message"] = message
-        RUN_STATE["logs"].append(
-            {
-                "time": timestamp,
-                "level": "done",
-                "message": message,
-            }
-        )
-        RUN_STATE["logs"] = RUN_STATE["logs"][-300:]
-    print(f"[{timestamp}] done    {message}", flush=True)
-
-
-def node_title(node):
-    return str(node.get("_meta", {}).get("title", "") or "")
-
-
-def confidence_label(score):
-    if score >= 90:
-        return "高"
-    if score >= 65:
-        return "中"
-    return "低"
-
-
-def classify_input_node(node_id, node):
-    class_type = str(node.get("class_type", ""))
-    title = node_title(node)
-    inputs = node.get("inputs", {})
-    lower = f"{class_type} {title}".lower()
-    candidates = []
-
-    for key, value in inputs.items():
-        key_lower = key.lower()
-        if isinstance(value, list):
-            continue
-        role = None
-        score = 0
-
-        if class_type == "LoadImage" and key_lower == "image":
-            role, score = "image", 98
-        elif "loadimage" in lower and key_lower in {"image", "file", "filename"}:
-            role, score = "image", 92
-        elif "loadvideo" in lower and key_lower in {"video", "file", "filename"}:
-            role, score = "video", 96
-        elif "vhs_loadvideo" in lower and key_lower == "video":
-            role, score = "video", 98
-        elif "video" in key_lower and isinstance(value, str):
-            role, score = "video", 72
-        elif "image" in key_lower and isinstance(value, str):
-            role, score = "image", 72
-        elif key_lower in {"file", "filename", "path"} and "load" in lower:
-            role, score = "file", 62
-
-        if role:
-            candidates.append(
-                {
-                    "id": str(node_id),
-                    "class_type": class_type,
-                    "title": title,
-                    "field": key,
-                    "role": role,
-                    "enabled": True,
-                    "current_value": value,
-                    "confidence": score,
-                    "confidence_label": confidence_label(score),
-                    "source_mode": "folder",
-                    "source_path": "",
-                }
-            )
-    return candidates
-
-
-def classify_output_node(node_id, node):
-    class_type = str(node.get("class_type", ""))
-    title = node_title(node)
-    inputs = node.get("inputs", {})
-    lower = f"{class_type} {title}".lower()
-    score = 0
-    self_saved = class_type in {"RuiUniversalImageSaver"} or class_type.lower().endswith("universalimagesaver")
-
-    if class_type in {"SaveImage", "SaveAnimatedWEBP", "SaveAudio"}:
-        score = 96
-    elif self_saved:
-        score = 82
-    elif "videocombine" in lower or "video combine" in lower:
-        score = 92
-    elif class_type.startswith("Save") or "save" in lower:
-        score = 82
-    elif "combine" in lower and "filename_prefix" in inputs:
-        score = 70
-
-    if not score:
-        return None
-
-    save_output = inputs.get("save_output")
-    enabled = save_output is not False
-    if save_output is False:
-        score = max(55, score - 25)
-
-    return {
-        "id": str(node_id),
-        "class_type": class_type,
-        "title": title,
-        "field": "filename_prefix" if "filename_prefix" in inputs else "filename",
-        "role": "output",
-        "enabled": enabled,
-        "current_value": inputs.get("filename_prefix", inputs.get("filename", "")),
-        "save_output": save_output,
-        "self_saved": self_saved,
-        "confidence": score,
-        "confidence_label": confidence_label(score),
-    }
-
-
-def analyze_workflow(workflow):
-    input_nodes = []
-    output_nodes = []
-    for node_id, node in workflow.items():
-        if not isinstance(node, dict):
-            continue
-        input_nodes.extend(classify_input_node(node_id, node))
-        output_node = classify_output_node(node_id, node)
-        if output_node:
-            output_nodes.append(output_node)
-
-    input_nodes.sort(key=lambda item: (-item["confidence"], natural_sort_key(item["id"])))
-    output_nodes.sort(key=lambda item: (-int(item["enabled"]), -item["confidence"], natural_sort_key(item["id"])))
-    return {"inputs": input_nodes, "outputs": output_nodes}
-
-
-def list_media_files(path, role):
-    directory = Path(path)
-    if not directory.exists() or not directory.is_dir():
-        raise ValueError(f"文件夹不存在: {path}")
-
-    if role == "image":
-        allowed = IMAGE_EXTENSIONS
-    elif role == "video":
-        allowed = VIDEO_EXTENSIONS
-    else:
-        allowed = None
-
-    files = []
-    for child in directory.iterdir():
-        if child.is_file() and (allowed is None or child.suffix.lower() in allowed):
-            files.append(child)
-    return sorted(files, key=lambda p: natural_sort_key(p.name))
-
-
-def build_batch_plan(inputs):
-    enabled_inputs = [item for item in inputs if item.get("enabled")]
-    if not enabled_inputs:
-        raise ValueError("没有启用任何输入节点")
-
-    prepared = []
-    batch_lengths = []
-    for item in enabled_inputs:
-        source_path = str(item.get("source_path", "")).strip().strip('"')
-        if not source_path:
-            raise ValueError(f"节点 {item.get('id')} 没有填写素材路径")
-        mode = item.get("source_mode", "folder")
-        role = item.get("role", "file")
-        if mode == "single":
-            source = Path(source_path)
-            if not source.exists() or not source.is_file():
-                raise ValueError(f"节点 {item.get('id')} 的单文件不存在: {source_path}")
-            files = [source]
-        else:
-            files = list_media_files(source_path, role)
-            if not files:
-                raise ValueError(f"节点 {item.get('id')} 的文件夹没有找到可用素材: {source_path}")
-            batch_lengths.append(len(files))
-        prepared.append({**item, "files": files})
-
-    total = min(batch_lengths) if batch_lengths else 1
-    if total < 1:
-        raise ValueError("没有可运行的素材")
-
-    batches = []
-    for index in range(total):
-        entries = []
-        names = []
-        for item in prepared:
-            files = item["files"]
-            source = files[0] if item.get("source_mode") == "single" else files[index]
-            names.append(source.stem)
-            entries.append({**item, "source": source})
-        batches.append({"index": index, "entries": entries, "base_name": choose_base_name(names, index)})
-    return batches, prepared
-
-
-def choose_base_name(names, index):
-    clean = [re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", name).strip("_") for name in names if name]
-    if not clean:
-        return f"batch_{index + 1:04d}"
-    base = clean[0]
-    if len(clean) > 1 and clean[1] != base:
-        base = f"{base}_{clean[1]}"
-    return base[:90] or f"batch_{index + 1:04d}"
-
-
-def comfy_request(server_url, path, payload=None, timeout=20):
-    url = server_url.rstrip("/") + path
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        raw = response.read()
-    return json.loads(raw.decode("utf-8")) if raw else {}
-
-
-def make_input_filename(batch_index, node_id, source):
-    safe_node = re.sub(r"[^0-9A-Za-z_-]+", "_", str(node_id)).strip("_") or "node"
-    return f"Batch_{batch_index + 1:04d}_{safe_node}_{source.name}"
-
-
-def copy_to_input(source, comfy_input, target_name):
-    comfy_input.mkdir(parents=True, exist_ok=True)
-    target = comfy_input / target_name
-    if source.resolve() != target.resolve():
-        shutil.copy2(source, target)
-    return target.name
-
-
-def set_nested_input(workflow, node_id, field, value):
-    node = workflow.get(str(node_id))
-    if not node:
-        return False
-    inputs = node.setdefault("inputs", {})
-    inputs[field] = value
-    return True
-
-
-def collect_output_files(history_item, comfy_output, prefix, since_time):
-    found = []
-    outputs = history_item.get("outputs", {}) if isinstance(history_item, dict) else {}
-    for output in outputs.values():
-        if not isinstance(output, dict):
-            continue
-        for group in ("images", "videos", "audio", "gifs"):
-            for item in output.get(group, []) or []:
-                filename = item.get("filename") if isinstance(item, dict) else None
-                subfolder = item.get("subfolder", "") if isinstance(item, dict) else ""
-                if filename:
-                    found.append(comfy_output / subfolder / filename)
-
-    for child in comfy_output.rglob("*"):
+    def metadata(address, reload=False):
+        cached = metadata_cache.get(address)
+        if not reload and cached and time.monotonic() - cached[0] < 120:
+            return cached[1], None
         try:
-            if child.is_file() and child.suffix.lower() in OUTPUT_EXTENSIONS:
-                if child.name.startswith(prefix) or child.stat().st_mtime >= since_time:
-                    found.append(child)
-        except OSError:
-            continue
+            values = transport(address, "/object_info", None, 3.5)
+            if not isinstance(values, dict) or not values:
+                raise OSError
+        except (OSError, ValueError):
+            return {}, "暂未取得 ComfyUI 节点信息，已按工作流结构分析。预览时会重新检查服务"
+        metadata_cache.put(address, (time.monotonic(), values))
+        return values, None
 
-    unique = []
-    seen = set()
-    for path in found:
-        key = str(path.resolve())
-        if key not in seen and path.exists():
-            seen.add(key)
-            unique.append(path)
-    return sorted(unique, key=lambda p: p.stat().st_mtime)
+    def update_config(updates):
+        with config_lock:
+            config = merge_config(load_config(config_path), updates)
+            write_config(config_path, config)
+            return config
 
-
-def move_outputs(files, output_dir, base_name):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    moved = []
-    for index, source in enumerate(files, start=1):
-        suffix = source.suffix or ".out"
-        name = f"{base_name}{suffix}" if len(files) == 1 else f"{base_name}_{index:02d}{suffix}"
-        target = output_dir / name
-        counter = 2
-        while target.exists():
-            target = output_dir / f"{Path(name).stem}_{counter}{suffix}"
-            counter += 1
-        shutil.move(str(source), str(target))
-        moved.append(target)
-    return moved
-
-
-def run_worker(payload):
-    config = payload.get("config", {})
-    workflow_id = payload.get("workflow_id")
-    workflow = WORKFLOW_CACHE.get(workflow_id)
-    if not workflow:
-        finish_run_state("找不到已导入的工作流，请重新导入")
-        return
-
-    comfy_root = Path(config.get("comfy_root") or DEFAULT_CONFIG["comfy_root"])
-    comfy_input = comfy_root / "input"
-    comfy_output = comfy_root / "output"
-    server_url = config.get("server_url") or DEFAULT_CONFIG["server_url"]
-    output_dir = Path(payload.get("output_dir") or config.get("last_output_dir") or "")
-    poll_interval = max(2, int(config.get("poll_interval") or DEFAULT_CONFIG["poll_interval"]))
-    outputs = [item for item in payload.get("outputs", []) if item.get("enabled")]
-
-    try:
-        if not comfy_input.exists():
-            raise ValueError(f"ComfyUI input 文件夹不存在: {comfy_input}")
-        if not comfy_output.exists():
-            raise ValueError(f"ComfyUI output 文件夹不存在: {comfy_output}")
-        if not output_dir:
-            raise ValueError("没有填写输出保存目录")
-        batches, prepared = build_batch_plan(payload.get("inputs", []))
-    except Exception as exc:
-        finish_run_state(str(exc))
-        add_log(str(exc), "error")
-        return
-
-    with STATE_LOCK:
-        RUN_STATE["total"] = len(batches)
-    add_log(f"准备运行 {len(batches)} 个批次")
-
-    for batch in batches:
-        with STATE_LOCK:
-            if RUN_STATE["stop_requested"]:
-                add_log("已停止后续任务", "warn")
-                break
-            RUN_STATE["current"] = batch["index"] + 1
-
-        prefix = f"Batch_{batch['index'] + 1:04d}_{batch['base_name']}"
-        add_log(f"开始第 {batch['index'] + 1}/{len(batches)} 批: {batch['base_name']}")
-        work = copy.deepcopy(workflow)
-
+    def build_preview(data):
+        draft = workflows.get(str(data.get("workflow_id", "")))
+        if not draft:
+            raise ValueError("请先上传本次任务的 API 工作流")
+        config = merge_config(load_config(config_path), data.get("config", {}))
+        config["server_url"] = server_address(config)
+        config["comfy_root"] = str(local_path(config["comfy_root"], "ComfyUI 根目录"))
+        for key, label in (("comfy_input_dir", "ComfyUI input 目录"), ("comfy_output_dir", "ComfyUI output 目录")):
+            if path_value(config[key]):
+                config[key] = str(local_path(config[key], label))
         try:
-            for entry in batch["entries"]:
-                target_name = make_input_filename(batch["index"], entry["id"], entry["source"])
-                filename = copy_to_input(entry["source"], comfy_input, target_name)
-                set_nested_input(work, entry["id"], entry["field"], filename)
-                add_log(f"节点 {entry['id']} 使用素材: {entry['source'].name} -> {filename}")
+            config["poll_interval"] = min(2.0, max(0.5, float(config["poll_interval"] or 1)))
+        except (ValueError, TypeError):
+            config["poll_interval"] = 1
+        output_dir = local_path(data.get("output_dir") or config["last_output_dir"], "成品保存目录")
+        if output_dir.exists() and not output_dir.is_dir():
+            raise ValueError(f"成品保存的位置是文件: {output_dir}")
+        warning = None
+        analysis = draft["analysis"]
+        if config["server_url"] != draft["server"] or draft["metadata_warning"]:
+            values, warning = metadata(config["server_url"])
+            if values:
+                analysis = WorkflowGraph(draft["workflow"], values).analyze()
+        if analysis["missing_types"] and not warning:
+            raise ValueError("目标 ComfyUI 缺少以下节点: " + "、".join(analysis["missing_types"][:14]))
+        if analysis["connection_warnings"] and not warning:
+            raise ValueError("；".join(analysis["connection_warnings"][:8]))
+        for field in ("inputs", "outputs"):
+            bindings = data.get(field, [])
+            if not isinstance(bindings, list) or not all(isinstance(item, dict) for item in bindings):
+                raise ValueError("节点绑定格式无效")
+        inputs, outputs = normalize_bindings(draft["workflow"], analysis, data)
+        comfy_input, comfy_output = paths_for(config)
+        if any(item["access"] == "upload" for item in inputs) and not comfy_input.is_dir():
+            raise ValueError(f"找不到 ComfyUI input 目录: {comfy_input}")
+        if any(item["mode"] == "history" for item in outputs) and not comfy_output.is_dir():
+            raise ValueError(f"找不到 ComfyUI output 目录: {comfy_output}")
+        items, unmatched = plan_batches(inputs, draft["workflow"], outputs)
+        snapshot = {"workflow": draft["workflow"], "config": config, "outputs": outputs, "output_dir": str(output_dir)}
+        return {"name": draft["name"], "snapshot": snapshot, "items": items,
+                "unmatched": unmatched, "warning": warning}
 
-            for output in outputs:
-                node = work.get(str(output.get("id")))
-                if node:
-                    node_inputs = node.setdefault("inputs", {})
-                    if "filename_prefix" in node_inputs:
-                        node_inputs["filename_prefix"] = prefix
-                    elif output.get("field"):
-                        node_inputs[output["field"]] = prefix
-                    if "save_output" in node_inputs:
-                        node_inputs["save_output"] = True
+    @app.errorhandler(ValueError)
+    def invalid_request(error):
+        return jsonify(error=str(error)), 409 if isinstance(error, QueueConflict) else 400
 
-            since_time = time.time()
-            result = comfy_request(server_url, "/prompt", {"prompt": work}, timeout=30)
-            prompt_id = result.get("prompt_id")
-            if not prompt_id:
-                raise RuntimeError(f"ComfyUI 没有返回 prompt_id: {result}")
+    @app.errorhandler(OSError)
+    def filesystem_error(error):
+        return jsonify(error=f"访问本地文件或服务失败: {error}"), 400
 
-            add_log(f"已提交任务 {prompt_id}")
-            history_item = None
-            while True:
-                time.sleep(poll_interval)
-                with STATE_LOCK:
-                    if RUN_STATE["stop_requested"]:
-                        add_log("收到停止请求，当前任务完成后将退出", "warn")
-                history = comfy_request(server_url, f"/history/{prompt_id}", timeout=30)
-                if prompt_id in history:
-                    history_item = history[prompt_id]
-                    break
-                add_log(f"任务 {prompt_id} 仍在运行")
+    @app.get("/")
+    def index():
+        return send_from_directory(STATIC_DIR, "index.html")
 
-            files = collect_output_files(history_item or {}, comfy_output, prefix, since_time)
-            if not files:
-                self_saved_outputs = [item for item in outputs if item.get("self_saved")]
-                if self_saved_outputs:
-                    names = ", ".join(f"#{item.get('id')} {item.get('class_type')}" for item in self_saved_outputs)
-                    with STATE_LOCK:
-                        RUN_STATE["success"] += 1
-                    add_log(f"任务完成，结果由工作流保存器保存: {names}", "success")
-                else:
-                    raise RuntimeError("任务完成，但没有找到可搬运的输出文件")
-            else:
-                moved = move_outputs(files, output_dir, batch["base_name"])
-                with STATE_LOCK:
-                    RUN_STATE["success"] += 1
-                add_log("已保存: " + " | ".join(str(path) for path in moved), "success")
-        except Exception as exc:
-            with STATE_LOCK:
-                RUN_STATE["failed"] += 1
-            add_log(f"第 {batch['index'] + 1} 批失败: {exc}", "error")
+    @app.get("/api/config")
+    def get_config():
+        return jsonify(load_config(config_path))
 
-    with STATE_LOCK:
-        success = RUN_STATE["success"]
-        failed = RUN_STATE["failed"]
-    finish_run_state(f"完成: 成功 {success}，失败 {failed}")
+    @app.post("/api/config")
+    def save_config():
+        return jsonify(update_config(body()))
 
-
-@app.get("/")
-def index():
-    return send_from_directory(STATIC_DIR, "index.html")
-
-
-@app.get("/api/config")
-def api_get_config():
-    return jsonify(load_config())
-
-
-@app.post("/api/config")
-def api_save_config():
-    data = request.get_json(force=True, silent=True) or {}
-    return jsonify(save_config(data))
-
-
-@app.post("/api/analyze-workflow")
-def api_analyze_workflow():
-    workflow_name = ""
-    workflow_path = ""
-
-    try:
+    @app.post("/api/analyze-workflow")
+    def analyze():
+        config = load_config(config_path)
         if "workflow" in request.files:
             file = request.files["workflow"]
-            workflow_name = file.filename
-            workflow = json.loads(file.read().decode("utf-8"))
+            name = (file.filename or "工作流.json").replace("\\", "/").split("/")[-1]
+            config["server_url"] = request.form.get("server_url") or config["server_url"]
+            workflow = checked_workflow(json.loads(file.read().decode("utf-8-sig")))
         else:
-            data = request.get_json(force=True, silent=True) or {}
-            workflow_path = str(data.get("workflow_path", "")).strip().strip('"')
-            if not workflow_path:
-                return jsonify({"error": "请选择或填写工作流 JSON"}), 400
-            workflow_name = Path(workflow_path).name
-            workflow = safe_json_load(workflow_path)
-    except Exception as exc:
-        return jsonify({"error": f"工作流读取失败: {exc}"}), 400
+            data = body()
+            path = local_path(data.get("workflow_path"), "API 工作流 JSON 路径")
+            name = path.name
+            config = merge_config(config, data.get("config", {}))
+            workflow = checked_workflow(json.loads(path.read_text(encoding="utf-8-sig")))
+            update_config({"last_workflow_path": str(path)})
+        address = server_address(config)
+        values, warning = metadata(address)
+        analysis = WorkflowGraph(workflow, values).analyze()
+        identity = uuid.uuid4().hex
+        workflows.put(identity, {"workflow": workflow, "analysis": analysis, "name": name,
+                                 "metadata_warning": warning, "server": address})
+        return jsonify(workflow_id=identity, workflow_name=name, warning=warning, **analysis)
 
-    workflow_id = uuid.uuid4().hex
-    WORKFLOW_CACHE[workflow_id] = workflow
-    analysis = analyze_workflow(workflow)
-    config = load_config()
-    if workflow_path:
-        config["last_workflow_path"] = workflow_path
-        save_config(config)
-    return jsonify({"workflow_id": workflow_id, "workflow_name": workflow_name, **analysis})
+    @app.post("/api/preview")
+    def preview_batch():
+        preview = build_preview(body())
+        token = uuid.uuid4().hex
+        previews.put(token, preview)
+        rows = [{
+            "position": index, "label": item["label"], "match": item["match"],
+            "paths": [entry["source"] for entry in item["entries"]],
+            "expected_direct": item.get("expected_direct"),
+        } for index, item in enumerate(preview["items"], start=1)]
+        return jsonify(preview_id=token, name=preview["name"], items=rows,
+                       unmatched=preview["unmatched"], warning=preview["warning"])
 
+    @app.post("/api/queue")
+    def enqueue():
+        data = body()
+        token = str(data.get("preview_id") or "")
+        existing = store.existing_job(token)
+        if existing:
+            return jsonify(job_id=existing)
+        planned = previews.get(token)
+        if not planned:
+            raise ValueError("配对预览已失效，请重新预览")
+        if planned["unmatched"] and data.get("accept_unmatched") is not True:
+            raise ValueError("请补齐素材，或确认排除未匹配的路径后再入队")
+        identity = store.enqueue(token, planned["name"], planned["snapshot"], planned["items"])
+        worker.notify()
+        return jsonify(job_id=identity)
 
-@app.post("/api/run-batch")
-def api_run_batch():
-    data = request.get_json(force=True, silent=True) or {}
-    with STATE_LOCK:
-        if RUN_STATE["running"]:
-            return jsonify({"error": "已有任务正在运行"}), 409
-    total_hint = 0
-    reset_run_state(total_hint)
-    thread = threading.Thread(target=run_worker, args=(data,), daemon=True)
-    thread.start()
-    return jsonify({"ok": True})
+    @app.post("/api/run-batch")
+    def run_batch():
+        data = body()
+        planned = build_preview(data)
+        if planned["unmatched"] and data.get("accept_unmatched") is not True:
+            raise ValueError("存在未匹配的素材，请通过预览确认")
+        identity = store.enqueue(uuid.uuid4().hex, planned["name"], planned["snapshot"], planned["items"])
+        store.set_enabled(True)
+        worker.notify()
+        return jsonify(ok=True, job_id=identity)
 
+    @app.post("/api/queue/start")
+    def start_queue():
+        store.set_enabled(True)
+        worker.notify()
+        return jsonify(ok=True)
 
-@app.get("/api/status")
-def api_status():
-    with STATE_LOCK:
-        snapshot = {
-            "running": RUN_STATE["running"],
-            "stop_requested": RUN_STATE["stop_requested"],
-            "started_at": RUN_STATE["started_at"],
-            "finished_at": RUN_STATE["finished_at"],
-            "total": RUN_STATE["total"],
-            "current": RUN_STATE["current"],
-            "success": RUN_STATE["success"],
-            "failed": RUN_STATE["failed"],
-            "message": RUN_STATE["message"],
-            "logs": list(RUN_STATE["logs"]),
-        }
-    return jsonify(snapshot)
+    @app.post("/api/queue/pause")
+    @app.post("/api/stop")
+    def pause_queue():
+        store.set_enabled(False)
+        worker.notify()
+        return jsonify(ok=True)
 
+    @app.get("/api/status")
+    def status():
+        return jsonify(store.snapshot())
 
-@app.post("/api/stop")
-def api_stop():
-    with STATE_LOCK:
-        RUN_STATE["stop_requested"] = True
-    add_log("已请求停止后续任务", "warn")
-    return jsonify({"ok": True})
+    @app.get("/api/queue/<int:job_id>")
+    def job_detail(job_id):
+        items = store.job_items(job_id)
+        if not items:
+            return jsonify(error="找不到该工作流任务"), 404
+        return jsonify(items=items)
 
+    @app.post("/api/queue/items/<int:item_id>")
+    def item_decision(item_id):
+        store.resolve(item_id, body().get("decision"))
+        worker.notify()
+        return jsonify(ok=True)
 
-@app.post("/api/check-comfy")
-def api_check_comfy():
-    data = request.get_json(force=True, silent=True) or {}
-    config = data.get("config", {})
-    root = Path(config.get("comfy_root") or DEFAULT_CONFIG["comfy_root"])
-    server_url = config.get("server_url") or DEFAULT_CONFIG["server_url"]
-    result = {
-        "input_exists": (root / "input").exists(),
-        "output_exists": (root / "output").exists(),
-        "server_ok": False,
-        "message": "",
-    }
-    try:
-        comfy_request(server_url, "/system_stats", timeout=5)
-        result["server_ok"] = True
-        result["message"] = "ComfyUI 连接正常"
-    except Exception as exc:
-        result["message"] = f"ComfyUI 未连接: {exc}"
-    return jsonify(result)
+    @app.post("/api/check-comfy")
+    def check_comfy():
+        config = merge_config(load_config(config_path), body().get("config", {}))
+        comfy_input, comfy_output = paths_for(config)
+        ok = True
+        message = "ComfyUI 连接正常"
+        try:
+            transport(server_address(config), "/system_stats", None, 4)
+        except (OSError, ValueError) as error:
+            ok, message = False, f"ComfyUI 未连接: {error}"
+        return jsonify(server_ok=ok, message=message, input_exists=comfy_input.is_dir(),
+                       output_exists=comfy_output.is_dir())
 
-
-@app.post("/api/pick")
-def api_pick():
-    data = request.get_json(force=True, silent=True) or {}
-    kind = data.get("kind", "folder")
-    initial = data.get("initial") or str(BASE_DIR)
-    try:
+    @app.post("/api/pick")
+    def pick():
         import tkinter as tk
         from tkinter import filedialog
 
+        data = body()
+        kind = data.get("kind", "folder")
+        initial = str(data.get("initial") or BASE_DIR)
+        if Path(initial).is_file():
+            initial = str(Path(initial).parent)
         root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        if kind == "file":
-            path = filedialog.askopenfilename(initialdir=initial)
-        elif kind == "workflow":
-            path = filedialog.askopenfilename(
-                initialdir=initial,
-                filetypes=[("ComfyUI API Workflow", "*.json"), ("All files", "*.*")],
-            )
-        else:
-            path = filedialog.askdirectory(initialdir=initial)
-        root.destroy()
-        return jsonify({"path": path or ""})
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        try:
+            root.withdraw()
+            root.attributes("-topmost", True)
+            if kind in {"workflow", "file"}:
+                filters = [("ComfyUI API Workflow", "*.json"), ("所有文件", "*.*")] if kind == "workflow" else [("所有文件", "*.*")]
+                chosen = filedialog.askopenfilename(parent=root, initialdir=initial, filetypes=filters)
+            else:
+                chosen = filedialog.askdirectory(parent=root, initialdir=initial)
+            return jsonify(path=chosen or "")
+        finally:
+            root.destroy()
+
+    return app
 
 
 def main():
-    config = save_config(load_config())
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
     port = int(os.environ.get("COMFY_BATCH_PORT", "7869"))
     url = f"http://127.0.0.1:{port}"
-    print("=" * 64)
-    print("FR_工作流通用批量工具")
-    print(f"打开地址: {url}")
-    print(f"ComfyUI 路径: {config['comfy_root']}")
-    print("按 Ctrl+C 可停止工具")
-    print("=" * 64)
-    if os.environ.get("COMFY_BATCH_NO_BROWSER") != "1":
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    app = create_app()
     server = make_server("127.0.0.1", port, app, threaded=True, request_handler=QuietRequestHandler)
+    worker = app.extensions["batch_worker"]
+    try:
+        worker.start()
+    except QueueConflict as error:
+        server.server_close()
+        raise SystemExit(str(error)) from None
+    print(f"FR 工作流通用批量工具 · {url} · Ctrl+C 关闭工具", flush=True)
+    if os.environ.get("COMFY_BATCH_NO_BROWSER") != "1":
+        threading.Timer(0.7, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nTool stopped.")
+        pass
+    finally:
+        worker.stop()
+        server.server_close()
 
 
 if __name__ == "__main__":
